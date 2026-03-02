@@ -19,6 +19,14 @@ export class TrackingService {
     private totalDistance: number = 0;
     private points: RoutePoint[] = [];
 
+    // GPS quality controls (meters / seconds)
+    private readonly initialFixAccuracyMeters = 15;
+    private readonly maxAccuracyMeters = 25;
+    private readonly minUpdateIntervalMs = 1500;
+    private readonly stationaryNoiseMeters = 4;
+    private readonly maxHikingSpeedMps = 8;
+    private readonly smoothingAlpha = 0.3;
+
     private constructor() { }
 
     static getInstance() {
@@ -60,7 +68,7 @@ export class TrackingService {
     }
 
     private async handleNewPosition(position: Position) {
-        const newPoint: RoutePoint = {
+        const rawPoint: RoutePoint = {
             lat: position.coords.latitude,
             lng: position.coords.longitude,
             alt: position.coords.altitude,
@@ -69,41 +77,40 @@ export class TrackingService {
             speed: position.coords.speed
         };
 
-        // --- INTELLIGENT GPS FILTERING ---
+        // Reject weak fixes (especially important for first lock)
+        if (rawPoint.accuracy > this.maxAccuracyMeters) return;
+        if (!this.lastPosition && rawPoint.accuracy > this.initialFixAccuracyMeters) return;
 
-        // 1. Extreme Accuracy Check
-        // If the signal is very weak (> 20m error), we don't trust it for distance.
-        if (newPoint.accuracy > 20) return;
-
-        // 2. Stationary Drift Protection (Speed Gating)
-        // If the hardware reports speed < 0.5 m/s (approx 1.8 km/h), 
-        // it's likely noise or the user is standing still/fidgeting.
-        const speedKmh = (newPoint.speed || 0) * 3.6;
-        const isActuallyMoving = speedKmh > 0.8; // Ignore movements slower than walking pace
-
-        // 3. Temporal Gating
-        // Don't process updates faster than once per 2 seconds to avoid jitter "noise".
-        if (this.lastPosition && (newPoint.timestamp - this.lastPosition.timestamp) < 2000) {
+        // Avoid high-frequency jitter updates
+        if (this.lastPosition && (rawPoint.timestamp - this.lastPosition.timestamp) < this.minUpdateIntervalMs) {
             return;
         }
 
-        // 4. Moving Average / Jitter Reduction
-        // We calculate distance based on a slightly "lazier" update to avoid zig-zagging.
+        // Smooth coordinates against previous accepted point
+        const newPoint = this.lastPosition
+            ? this.smoothPoint(this.lastPosition, rawPoint)
+            : rawPoint;
+
         if (this.lastPosition) {
             const dist = this.calculateDistance(
                 this.lastPosition.lat, this.lastPosition.lng,
                 newPoint.lat, newPoint.lng
             );
 
-            // If we are "stationary" (low speed), we only count distance if it's a significant jump
-            // otherwise we assume it's just GPS sensors drifting around.
-            if (!isActuallyMoving && dist < 0.005) return; // 5 meters threshold for non-moving updates
-
-            // Final sanity check: Human speed limit (Walking/Running max)
-            // If movement jump implies > 40 km/h (unless they are in a car, but this is a hiking app), it's a spike.
+            const distanceMeters = dist * 1000;
             const timeDiff = (newPoint.timestamp - this.lastPosition.timestamp) / 1000;
-            const velocity = (dist * 1000) / timeDiff; // meters per second
-            if (velocity > 12) return; // Ignore if > 43 km/h (Bolt speed)
+            if (timeDiff <= 0) return;
+
+            const inferredSpeedMps = distanceMeters / timeDiff;
+            const sensorSpeedMps = newPoint.speed || 0;
+
+            // Accept movement only if either GPS speed or geometric movement confirms it
+            const movingBySensor = sensorSpeedMps > 0.7;
+            const movingByDistance = distanceMeters > Math.max(this.stationaryNoiseMeters, newPoint.accuracy * 0.35);
+            if (!movingBySensor && !movingByDistance) return;
+
+            // Spike rejection for impossible hiking/running jumps
+            if (inferredSpeedMps > this.maxHikingSpeedMps) return;
 
             this.totalDistance += dist;
         }
@@ -133,6 +140,15 @@ export class TrackingService {
                 routeId: this.currentRouteId
             }
         }));
+    }
+
+    private smoothPoint(previous: RoutePoint, current: RoutePoint): RoutePoint {
+        const alpha = this.smoothingAlpha;
+        return {
+            ...current,
+            lat: previous.lat + alpha * (current.lat - previous.lat),
+            lng: previous.lng + alpha * (current.lng - previous.lng)
+        };
     }
 
     private calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {

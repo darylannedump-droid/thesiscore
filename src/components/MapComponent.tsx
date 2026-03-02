@@ -28,9 +28,24 @@ const DEFAULT_CENTER: [number, number] = [16.5916, 120.8986];
 
 function MapController({ center }: { center: [number, number] }) {
     const map = useMap();
+    const lastCenterRef = useRef<L.LatLng | null>(null);
+
     useEffect(() => {
-        map.setView(center, map.getZoom());
+        const next = L.latLng(center[0], center[1]);
+
+        if (!lastCenterRef.current) {
+            map.setView(next, map.getZoom());
+            lastCenterRef.current = next;
+            return;
+        }
+
+        const driftMeters = lastCenterRef.current.distanceTo(next);
+        if (driftMeters >= 4) {
+            map.panTo(next, { animate: true, duration: 0.25 });
+            lastCenterRef.current = next;
+        }
     }, [center, map]);
+
     return null;
 }
 
@@ -69,7 +84,7 @@ export default function MapComponent({ center = DEFAULT_CENTER, zoom = 13 }: Map
     }, [center, drawnPath]);
 
     const handleMapClick = (e: L.LeafletMouseEvent) => {
-        setDrawnPath([...drawnPath, [e.latlng.lat, e.latlng.lng]]);
+        setDrawnPath((prev) => [...prev, [e.latlng.lat, e.latlng.lng]]);
     };
 
     return (
